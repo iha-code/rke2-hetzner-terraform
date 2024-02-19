@@ -1,0 +1,86 @@
+#cloud-config
+users:
+  - name: rke2-user
+    groups: users, admin
+    sudo: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+      %{ if length(public_key) > 0 }
+    ssh_authorized_keys:
+      %{ for ssh_key in public_key }
+    - ${ssh_key}
+      %{ endfor }
+      %{ endif }
+write_files:
+  - path: /etc/rancher/rke2/config.yaml
+    permissions: "0600"
+    owner: root:root
+    content: |
+      write-kubeconfig-mode: "0644"
+      cloud-provider-name: external
+      cluster-cidr: 10.244.0.0/16
+      kube-proxy-arg: "metrics-bind-address=0.0.0.0"
+      disable:
+        - cloud-controller
+        - rke2-ingress-nginx
+        - rke2-canal
+      %{ if master_index != 0 }
+      server: https://${lb_address}:9345
+      %{ endif }
+      tls-san:
+        - ${lb_address}
+        - ${lb_ext_ip}
+        - master
+       %{ for domain in domains }
+        - ${domain}
+       %{ endfor }
+      token: ${rke2_cluster_secret}
+      cni: cilium
+      debug: true
+  - path: /opt/rke2/run_rke2.sh
+    permissions: "0775"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      curl -fsSL https://raw.githubusercontent.com/rancher/rke2/master/install.sh --output /root/install.sh
+      chmod u+x /root/install.sh
+      INSTALL_RKE2_METHOD='tar' INSTALL_RKE2_TYPE=server INSTALL_RKE2_VERSION=${rke2_version} /root/install.sh
+      systemctl enable rke2-server
+      systemctl start rke2-server
+runcmd:
+  - apt-get update
+  - apt-get install -y git vim software-properties-common resolvconf linux-headers-$(uname -r) jq curl open-iscsi
+  - echo "nameserver 1.1.1.1" > /etc/resolvconf/resolv.conf.d/tail
+  - max_retries=30; retries=0; while [ ! -f '/etc/rancher/rke2/rke2.yaml' ] && [ $retries -lt $max_retries ]; do   echo 'File not found. Retrying in 5 seconds...' &&  retries=$((retries+1)) && sleep 5; done; /opt/rke2/run_rke2.sh
+  - rm /opt/rke2/run_rke2.sh
+  - echo "RateLimitIntervalSec=0" >> /etc/systemd/journald.conf
+  - echo "RateLimitBurst=0" >> /etc/systemd/journald.conf
+  - systemctl restart systemd-journald.service
+  - systemctl start resolvconf
+  - cp -i $(find /var/lib/rancher/ -name kubectl |  head -1 ) /usr/bin
+  - mkdir -p /root/.kube
+  - mkdir -p /home/rke2-user/.kube
+  - cat /etc/rancher/rke2/rke2.yaml > /home/rke2-user/.kube/config
+  - chown -R rke2-user:rke2-user /home/rke2-user/.kube
+  - chmod 600 /home/rke2-user/.kube/config
+  - cat /root/.ssh/authorized_keys >  /home/rke2-user/.ssh/authorized_keys
+  - chown -R rke2-user:rke2-user  /home/rke2-user/.ssh
+  - chmod 700 /home/rke2-user/.ssh
+  - chmod 600 /home/rke2-user/.ssh/authorized_keys
+  - cat /etc/rancher/rke2/rke2.yaml > /root/.kube/config
+  - chmod 600 /root/.kube/config
+  - echo "export KUBECONFIG=/home/rke2-user/.kube/config" >> /home/rke2-user/.profile
+  - curl -o /tmp/get-helm-3.sh -O "https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3"
+  - chmod u+x /tmp/get-helm-3.sh
+  - /tmp/get-helm-3.sh
+  - sed -ie '/#Port 22/s/^.*$/Port 2233/' /etc/ssh/sshd_config
+  - sed -ie '/^PermitRootLogin/s/^.*$/PermitRootLogin no/' /etc/ssh/sshd_config
+  - sed -ie '/^PasswordAuthentication/s/^.*$/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -ie '/^X11Forwarding/s/^.*$/X11Forwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#MaxAuthTries/s/^.*$/MaxAuthTries 2/' /etc/ssh/sshd_config
+  - sed -ie '/^#AllowTcpForwarding/s/^.*$/AllowTcpForwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#AllowAgentForwarding/s/^.*$/AllowAgentForwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#AuthorizedKeysFile/s/^.*$/AuthorizedKeysFile .ssh/authorized_keys/' /etc/ssh/sshd_config
+  - sed -i '$a AllowUsers rke2-user' /etc/ssh/sshd_config
+  - systemctl restart ssh
+
